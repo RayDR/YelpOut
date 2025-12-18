@@ -30,7 +30,22 @@ import { FiMenu, FiAlertTriangle } from "react-icons/fi";
 
 // Helper function to convert 24-hour time to 12-hour AM/PM format
 function formatTime12Hour(time24: string): string {
-  const [hours, minutes] = time24.split(':').map(Number);
+  if (!time24 || typeof time24 !== 'string') {
+    return '12:00 AM'; // Fallback for invalid input
+  }
+  
+  const parts = time24.split(':');
+  if (parts.length !== 2) {
+    return '12:00 AM'; // Fallback for invalid format
+  }
+  
+  const hours = parseInt(parts[0]);
+  const minutes = parseInt(parts[1]);
+  
+  if (isNaN(hours) || isNaN(minutes)) {
+    return '12:00 AM'; // Fallback for NaN values
+  }
+  
   const period = hours >= 12 ? 'PM' : 'AM';
   const hours12 = hours % 12 || 12;
   return `${hours12}:${minutes.toString().padStart(2, '0')} ${period}`;

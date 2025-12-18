@@ -1,4 +1,5 @@
 import { PlanContext, BudgetTier } from "@/modules/planning/types";
+import { normalizeTimeTo24h } from "@/lib/planner/timeUtils";
 
 /**
  * Conversation flow manager for YelpOut
@@ -8,6 +9,7 @@ import { PlanContext, BudgetTier } from "@/modules/planning/types";
 export type QuestionKey = 
   | "eventType"
   | "location"
+  | "clarifyLocation"
   | "groupSize"
   | "groupType"
   | "hasPets"
@@ -82,7 +84,7 @@ export const CONVERSATION_FLOW: ConversationQuestion[] = [
     translationKey: "questions.startTime",
     chips: (ctx) => {
       const allTimeChips = [
-        "chips.now",  // Add "Now" option
+        "chips.now",  // "Now" option - only for today
         "10:00 AM",
         "12:00 PM",
         "2:00 PM",
@@ -127,7 +129,8 @@ export const CONVERSATION_FLOW: ConversationQuestion[] = [
         }
       }
       
-      return allTimeChips;
+      // For future dates, exclude "Now" chip
+      return allTimeChips.filter(chip => chip !== "chips.now");
     },
     contextField: "event",
     isRequired: true,
@@ -231,14 +234,27 @@ export const CONVERSATION_FLOW: ConversationQuestion[] = [
   {
     key: "cuisine",
     translationKey: "questions.cuisine",
-    chips: [
-      "cuisine.mexican",
-      "cuisine.italian",
-      "cuisine.asian",
-      "cuisine.american",
-      "cuisine.mediterranean",
-      "chips.noPreference",
-    ],
+    chips: (ctx) => {
+      const allCuisines = [
+        "cuisine.mexican",
+        "cuisine.italian",
+        "cuisine.asian",
+        "cuisine.american",
+        "cuisine.mediterranean",
+      ];
+      
+      // If we already detected a cuisine preference, put it first
+      if (ctx.preferences?.cuisine && ctx.preferences.cuisine.length > 0) {
+        const detected = ctx.preferences.cuisine[0]; // Take first detected
+        const detectedChip = `cuisine.${detected}`;
+        
+        // Remove it from array and put it first
+        const filtered = allCuisines.filter(c => c !== detectedChip);
+        return [detectedChip, ...filtered, "chips.noPreference"];
+      }
+      
+      return [...allCuisines, "chips.noPreference"];
+    },
     contextField: "preferences",
     isRequired: false,
     shouldAsk: (ctx) => !ctx.preferences?.cuisine || ctx.preferences.cuisine.length === 0,
@@ -726,14 +742,6 @@ export function parseUserResponse(
       };
       break;
 
-    case "location":
-      // When answering location question directly, use parseLocationValue
-      return parseLocationValue(message);
-
-    case "duration":
-      // When answering duration question directly, use parseDurationValue
-      return parseDurationValue(message, context);
-
     case "clarifyAmPm":
       // Handle AM/PM clarification for ambiguous times
       const tempHour = context.event?._tempHour;
@@ -755,6 +763,46 @@ export function parseUserResponse(
           _tempHour: undefined,
           _tempMinutes: undefined,
         };
+      }
+      break;
+
+    case "clarifyLocation":
+      // Handle state/ZIP clarification for incomplete location
+      const baseCity = (context.location as any)?._tempCity || "";
+      const clarification = message.trim();
+      
+      // Check if it's a state code (2 letters)
+      if (/^[A-Z]{2}$/i.test(clarification)) {
+        updates.location = {
+          text: `${baseCity}, ${clarification.toUpperCase()}`,
+          radiusKm: 15,
+        };
+        // Clear temp city
+        delete (updates.location as any)._tempCity;
+      }
+      // Check if it's a ZIP code
+      else if (/^\d{5}(-\d{4})?$/.test(clarification)) {
+        updates.location = {
+          text: clarification,
+          radiusKm: 10,
+        };
+        delete (updates.location as any)._tempCity;
+      }
+      // User provided full location (City, ST)
+      else if (/,\s*[A-Z]{2}/.test(clarification)) {
+        updates.location = {
+          text: clarification,
+          radiusKm: 15,
+        };
+        delete (updates.location as any)._tempCity;
+      }
+      // Still incomplete, keep asking
+      else {
+        // Keep the temp city for next attempt
+        updates.location = {
+          ...context.location,
+          _tempCity: baseCity,
+        } as any;
       }
       break;
 
@@ -934,16 +982,10 @@ export function parseUserResponse(
 
     case "duration":
       // Check if we have a valid start time (not NEEDS_CLARIFICATION)
-      const start = context.event?.startTime && context.event.startTime !== "NEEDS_CLARIFICATION" 
+      let start = context.event?.startTime && context.event.startTime !== "NEEDS_CLARIFICATION" 
         ? context.event.startTime 
-        : "12:00";
+        : "18:00"; // Default to 6 PM if no start time
       let durationHours = 2;
-      
-      // Validate start time format - must be HH:MM in 24h format
-      if (!start || !start.match(/^\d{1,2}:\d{2}$/)) {
-        // Invalid format, skip duration calculation
-        break;
-      }
       
       // Extract duration from natural language
       // Handle specific phrases first
@@ -973,24 +1015,38 @@ export function parseUserResponse(
         }
       }
       
-      // Parse start time - ensure it's a valid time format
-      if (!start.includes(":")) {
-        // Invalid format, use default
+      // Validate and normalize start time format
+      if (!start || !start.includes(":")) {
+        start = "18:00"; // Default to 6 PM
+      }
+      
+      // Ensure proper format - may have single digit hour
+      const timeParts = start.split(":");
+      if (timeParts.length !== 2) {
+        start = "18:00";
+      }
+      
+      const [startHour, startMin] = start.split(":").map(Number);
+      
+      // Validate numbers
+      if (isNaN(startHour) || isNaN(startMin)) {
+        // Invalid time, use default calculation
+        const defaultEnd = 20; // 8 PM (18:00 + 2 hours)
         updates.event = {
           ...context.event,
-          endTime: "14:00", // Default 2 hours from noon
+          endTime: `${defaultEnd.toString().padStart(2, '0')}:00`,
         };
         break;
       }
       
-      const [startHour, startMin] = start.split(":").map(Number);
       const totalMinutes = (startHour * 60 + startMin) + (durationHours * 60);
       let endHour = Math.floor(totalMinutes / 60);
       let endMin = Math.round(totalMinutes % 60);
       
-      if (endHour >= 24) endHour = 23;
+      if (endHour >= 24) endHour = endHour % 24;
       if (endMin >= 60) {
-        endMin = 59;
+        endHour += 1;
+        endMin = 0;
       }
       
       const endTime = `${endHour.toString().padStart(2, '0')}:${endMin.toString().padStart(2, '0')}`;
@@ -1327,31 +1383,35 @@ function extractDate(message: string): string | null {
   const lowerMessage = message.toLowerCase();
   const today = new Date();
   
+  // Helper to get local date in YYYY-MM-DD format (avoiding UTC timezone issues)
+  const getLocalDateISO = (date: Date): string => {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+  
   // Check for "hoy" or "today" with word boundaries
   if (/\b(hoy|today)\b/i.test(lowerMessage)) {
-    const dateISO = today.toISOString().split('T')[0];
-    return dateISO;
+    return getLocalDateISO(today);
   }
   
   // Check for time-of-day phrases that imply today
   // tonight, this evening, this afternoon, this morning, etc.
   if (/\b(tonight|tonite|this\s+(evening|afternoon|morning|night))\b/i.test(lowerMessage)) {
-    const dateISO = today.toISOString().split('T')[0];
-    return dateISO;
+    return getLocalDateISO(today);
   }
   
   // Spanish equivalents: esta noche, esta tarde, esta mañana
   if (/\b(esta\s+(noche|tarde|mañana))\b/i.test(lowerMessage)) {
-    const dateISO = today.toISOString().split('T')[0];
-    return dateISO;
+    return getLocalDateISO(today);
   }
   
   // Check for "mañana" or "tomorrow" as complete words (not in "en la mañana")
   if (/\b(mañana|tomorrow)\b/i.test(lowerMessage) && !/\b(la|en)\s+(mañana)\b/i.test(lowerMessage)) {
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
-    const dateISO = tomorrow.toISOString().split('T')[0];
-    return dateISO;
+    return getLocalDateISO(tomorrow);
   }
   
   // Check for day of week patterns (this Saturday, next Monday, etc)
@@ -1388,8 +1448,7 @@ function extractDate(message: string): string | null {
         
         const targetDate = new Date(today);
         targetDate.setDate(today.getDate() + daysToAdd);
-        const dateISO = targetDate.toISOString().split('T')[0];
-        return dateISO;
+        return getLocalDateISO(targetDate);
       }
     }
   }
@@ -1401,8 +1460,7 @@ function extractDate(message: string): string | null {
     const day = parseInt(dateMatch[2]);
     const year = dateMatch[3] ? parseInt(dateMatch[3]) : today.getFullYear();
     const date = new Date(year, month, day);
-    const dateISO = date.toISOString().split('T')[0];
-    return dateISO;
+    return getLocalDateISO(date);
   }
   
   return null;
@@ -1442,22 +1500,33 @@ function extractTime(message: string): { time: string | null, needsClarification
   
   // Explicit time patterns (3:30pm, 15:30, 3pm)
   const timePatterns = [
-    /(\d{1,2}):(\d{2})\s*(am|pm)/i,  // 3:30pm, 3:30 pm
-    /(\d{1,2})\s*(am|pm)/i,          // 3pm, 3 pm
-    /(?:at|a(?:\s+las)?)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i, // a las 3pm
+    /(\d{1,2}):(\d{2})\s*(am|pm)/i,  // 3:30pm, 3:30 pm (group 1=hour, 2=min, 3=meridiem)
+    /(\d{1,2})\s*(am|pm)/i,          // 3pm, 3 pm (group 1=hour, 2=meridiem, NO minutes)
+    /(?:at|a(?:\s+las)?)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i, // a las 3pm (group 1=hour, 2=min, 3=meridiem)
   ];
   
   for (const pattern of timePatterns) {
     const match = message.match(pattern);
     if (match) {
       let hours = parseInt(match[1]);
-      const minutes = match[2] ? match[2] : "00";
-      const meridiem = match[3]?.toUpperCase();
+      let minutes = "00";
+      let meridiem = "";
+      
+      // Determine which groups are minutes vs meridiem based on pattern
+      if (pattern.source.includes(":(\\\d{2})")) {
+        // Pattern has minutes group: group 2 is minutes, group 3 is meridiem
+        minutes = match[2] || "00";
+        meridiem = match[3]?.toUpperCase() || "";
+      } else {
+        // Pattern has NO minutes group: group 2 is meridiem directly
+        minutes = "00";
+        meridiem = match[2]?.toUpperCase() || "";
+      }
       
       if (meridiem === "PM" && hours !== 12) hours += 12;
       if (meridiem === "AM" && hours === 12) hours = 0;
       
-      const time = `${hours.toString().padStart(2, '0')}:${minutes}`;
+      const time = `${hours.toString().padStart(2, '0')}:${minutes.padStart(2, '0')}`;
       return { time };
     }
   }
@@ -1473,9 +1542,9 @@ function extractTime(message: string): { time: string | null, needsClarification
     const targetHour = hour2 ? Math.floor((hour1 + hour2) / 2) : hour1;
     
     // Check if context provides AM/PM hint (evening, tarde, noche, afternoon, morning)
-    const hasEveningContext = /\b(evening|tarde|noche|tonight|esta\s+noche)\b/i.test(lowerMessage);
-    const hasAfternoonContext = /\b(afternoon|mediodía|mediodia)\b/i.test(lowerMessage);
-    const hasMorningContext = /\b(morning|mañana)\b/i.test(lowerMessage);
+    const hasEveningContext = /\b(evening|tarde|noche|tonight|esta\s+noche|dinner|cena)\b/i.test(lowerMessage);
+    const hasAfternoonContext = /\b(afternoon|mediodía|mediodia|lunch|almuerzo|comida)\b/i.test(lowerMessage);
+    const hasMorningContext = /\b(morning|mañana|breakfast|desayuno)\b/i.test(lowerMessage);
     
     // If we have time-of-day context, use it instead of asking
     if (hasEveningContext) {
@@ -1517,9 +1586,9 @@ function extractTime(message: string): { time: string | null, needsClarification
       const minutes = ambiguousMatch[2] || "00";
       
       // Check for time-of-day context in message
-      const hasEveningContext = /\b(evening|tarde|noche|tonight|esta\s+noche)\b/i.test(lowerMessage);
-      const hasAfternoonContext = /\b(afternoon|mediodía|mediodia)\b/i.test(lowerMessage);
-      const hasMorningContext = /\b(morning|mañana)\b/i.test(lowerMessage);
+      const hasEveningContext = /\b(evening|tarde|noche|tonight|esta\s+noche|dinner|cena)\b/i.test(lowerMessage);
+      const hasAfternoonContext = /\b(afternoon|mediodía|mediodia|lunch|almuerzo|comida)\b/i.test(lowerMessage);
+      const hasMorningContext = /\b(morning|mañana|breakfast|desayuno)\b/i.test(lowerMessage);
       
       // If we have clear time-of-day context, don't ask for AM/PM
       if (hasEveningContext && hours >= 1 && hours <= 11) {
@@ -1602,7 +1671,23 @@ function extractLocation(message: string): string | null {
     }
   }
   
-  // 3. Explicit city patterns with state (most reliable)
+  // 3. Look for area prefixes (downtown, north, south, etc.) with city names
+  const areaPrefixPatterns = [
+    /\b(?:in|en)\s+(downtown|uptown|midtown|north|south|east|west|central)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i,
+    /\b(downtown|uptown|midtown|north|south|east|west|central)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i,
+  ];
+  
+  for (const pattern of areaPrefixPatterns) {
+    const match = message.match(pattern);
+    if (match) {
+      const area = match[1];
+      const city = match[2];
+      // Return as "City" - the area prefix is context but we want the city name
+      return city;
+    }
+  }
+  
+  // 4. Explicit city patterns with state (most reliable)
   const cityPatterns = [
     /\b(?:in|en)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z]{2})\b/i,
     /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z]{2})\b/i, // City, ST format
@@ -1616,25 +1701,59 @@ function extractLocation(message: string): string | null {
     }
   }
   
-  // 4. Look for common city names (without state) - accept any reasonable city name
+  // 5. Look for common city names (without state) - accept any reasonable city name
   // This allows flexibility for users to just say "Dallas" or "New York"
-  const cityKeywords = [
-    /\b(?:in|en)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b/i,
-  ];
-  
-  for (const pattern of cityKeywords) {
-    const match = message.match(pattern);
-    if (match && match[1].length >= 3) {
-      const cityName = match[1];
-      // Avoid matching common non-city words
-      const excludeWords = ['the', 'and', 'but', 'with', 'for', 'about', 'today', 'tomorrow', 'weekend'];
-      if (!excludeWords.includes(cityName.toLowerCase())) {
-        return cityName;
-      }
+  // Priority patterns: "in CityName" format
+  const cityInPattern = /\b(?:in|en|at|a)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b(?!\s+with|\s+for|\s+about|\s+,)/i;
+  const cityMatch = message.match(cityInPattern);
+  if (cityMatch && cityMatch[1].length >= 3) {
+    const cityName = cityMatch[1];
+    // Avoid matching common non-city words
+    const excludeWords = ['the', 'and', 'but', 'with', 'for', 'about', 'today', 'tomorrow', 'weekend', 'morning', 'afternoon', 'evening', 'night'];
+    if (!excludeWords.includes(cityName.toLowerCase())) {
+      return cityName;
     }
   }
   
   return null;
+}
+
+/**
+ * Validate if location has enough information for Yelp API
+ * Returns true if location is valid, false if needs state/zip
+ */
+export function isLocationValid(locationText: string): boolean {
+  if (!locationText || locationText === "REQUEST_GEOLOCATION") {
+    return true; // Will be handled separately
+  }
+  
+  // Check if it has a ZIP code
+  if (/\b\d{5}(?:-\d{4})?\b/.test(locationText)) {
+    return true;
+  }
+  
+  // Check if it has state code (City, ST format)
+  if (/,\s*[A-Z]{2}\b/.test(locationText)) {
+    return true;
+  }
+  
+  // Check if it's a full address with street number
+  if (/^\d+\s+[A-Za-z]/.test(locationText)) {
+    return true;
+  }
+  
+  // Otherwise, it's just a city name without state - needs clarification
+  return false;
+}
+
+/**
+ * Get state/location clarification message
+ */
+export function getLocationClarification(cityName: string, language: string = 'en'): string {
+  if (language === 'es') {
+    return `Encontré "${cityName}" pero necesito más información. ¿En qué estado está? (ejemplo: TX, CA, NY) o proporciona un código postal.`;
+  }
+  return `I found "${cityName}" but need more details. What state is it in? (e.g., TX, CA, NY) or provide a ZIP code.`;
 }
 
 // Main extraction function
@@ -1650,10 +1769,23 @@ export function extractInitialInfo(message: string): Partial<PlanContext> {
   
   // Extract in specific order - most specific first
   
-  // 1. Extract event type (most important, sets context for everything else)
+  // 1. Extract date FIRST (before event type) to avoid confusion
+  // "tonight" should be detected as a date, not as event type "date"
+  const dateISO = extractDate(correctedMessage);
+  if (dateISO) {
+    context.event = {
+      dateISO,
+    };
+  } else {
+  }
+  
+  // 2. Extract event type (sets context for participants)
   const eventType = extractEventType(correctedMessage);
   if (eventType) {
-    context.event = { type: eventType.type };
+    context.event = {
+      ...context.event,
+      type: eventType.type
+    };
     
     // Auto-configure based on event type
     if (eventType.type === "date") {
@@ -1669,16 +1801,6 @@ export function extractInitialInfo(message: string): Partial<PlanContext> {
         pets: false,
       };
     }
-  } else {
-  }
-  
-  // 2. Extract date
-  const dateISO = extractDate(correctedMessage);
-  if (dateISO) {
-    context.event = {
-      ...context.event,
-      dateISO,
-    };
   } else {
   }
   
@@ -1721,6 +1843,7 @@ export function extractInitialInfo(message: string): Partial<PlanContext> {
   const lowerMessage = correctedMessage.toLowerCase();
   let budgetTier: BudgetTier | undefined;
   
+  // Check for explicit dollar signs first
   if (lowerMessage.includes("$$$$")) {
     budgetTier = "$$$$";
   } else if (lowerMessage.includes("$$$")) {
@@ -1729,8 +1852,15 @@ export function extractInitialInfo(message: string): Partial<PlanContext> {
     budgetTier = "$$";
   } else if (lowerMessage.includes("$") && !lowerMessage.includes("$$")) {
     budgetTier = "$";
-  } else if (lowerMessage.includes("economical") || lowerMessage.includes("económico") || 
-             lowerMessage.includes("cheap") || lowerMessage.includes("barato")) {
+  }
+  // Check for negative phrases indicating middle tier
+  else if (/(not|nothing)\s+(too\s+)?(fancy|expensive|cheap|barato|caro)/i.test(lowerMessage) ||
+           /but\s+not\s+(cheap|expensive|barato|caro)/i.test(lowerMessage)) {
+    budgetTier = "$$";
+  }
+  // Check for explicit tier keywords
+  else if (lowerMessage.includes("economical") || lowerMessage.includes("económico") || 
+           lowerMessage.includes("cheap") || lowerMessage.includes("barato")) {
     budgetTier = "$";
   } else if (lowerMessage.includes("no muy caro") || lowerMessage.includes("not too expensive") ||
              lowerMessage.includes("moderate") || lowerMessage.includes("moderado") || 
@@ -1754,24 +1884,39 @@ export function extractInitialInfo(message: string): Partial<PlanContext> {
   // 6. Extract mood (do this last since it might catch general words)
   const moods: string[] = [];
   
-  // Check for mood keywords
-  if (lowerMessage.includes("romantic") || lowerMessage.includes("romántic")) {
+  // Helper function to check if a keyword appears in a negative context
+  const isNegativeContext = (keyword: string): boolean => {
+    const negativePatterns = [
+      new RegExp(`(not|nothing|n't)\\s+(too\\s+)?${keyword}`, 'i'),
+      new RegExp(`but\\s+not\\s+${keyword}`, 'i'),
+      new RegExp(`without\\s+${keyword}`, 'i')
+    ];
+    return negativePatterns.some(pattern => pattern.test(lowerMessage));
+  };
+  
+  // Check for mood keywords (only if not in negative context)
+  if ((lowerMessage.includes("romantic") || lowerMessage.includes("romántic")) && 
+      !isNegativeContext("romantic")) {
     moods.push("romantic");
   }
-  if (lowerMessage.includes("calm") || lowerMessage.includes("tranquil") || lowerMessage.includes("quiet") || 
-      lowerMessage.includes("peaceful") || lowerMessage.includes("tranquilo")) {
+  if ((lowerMessage.includes("calm") || lowerMessage.includes("tranquil") || lowerMessage.includes("quiet") || 
+      lowerMessage.includes("peaceful") || lowerMessage.includes("tranquilo")) &&
+      !isNegativeContext("calm") && !isNegativeContext("quiet")) {
     moods.push("quiet");
   }
-  if (lowerMessage.includes("fun") || lowerMessage.includes("lively") || lowerMessage.includes("energetic") || 
-      lowerMessage.includes("party") || lowerMessage.includes("divertido") || lowerMessage.includes("animado")) {
+  if ((lowerMessage.includes("fun") || lowerMessage.includes("lively") || lowerMessage.includes("energetic") || 
+      lowerMessage.includes("party") || lowerMessage.includes("divertido") || lowerMessage.includes("animado")) &&
+      !isNegativeContext("fun") && !isNegativeContext("lively")) {
     moods.push("lively");
   }
-  if (lowerMessage.includes("fancy") || lowerMessage.includes("elegant") || lowerMessage.includes("upscale") || 
-      lowerMessage.includes("classy") || lowerMessage.includes("elegante") || lowerMessage.includes("fino")) {
+  if ((lowerMessage.includes("fancy") || lowerMessage.includes("elegant") || lowerMessage.includes("upscale") || 
+      lowerMessage.includes("classy") || lowerMessage.includes("elegante") || lowerMessage.includes("fino")) &&
+      !isNegativeContext("fancy") && !isNegativeContext("upscale") && !isNegativeContext("elegant")) {
     moods.push("upscale");
   }
-  if (lowerMessage.includes("casual") || lowerMessage.includes("relaxed") || 
-      lowerMessage.includes("laid-back") || lowerMessage.includes("informal")) {
+  if ((lowerMessage.includes("casual") || lowerMessage.includes("relaxed") || 
+      lowerMessage.includes("laid-back") || lowerMessage.includes("informal")) &&
+      !isNegativeContext("casual")) {
     moods.push("casual");
   }
   
@@ -1789,6 +1934,7 @@ export function extractInitialInfo(message: string): Partial<PlanContext> {
   const cuisineKeywords: Record<string, string[]> = {
     'mexican': ['mexican', 'mexicana', 'mexicano', 'tacos', 'burrito'],
     'italian': ['italian', 'italiana', 'italiano', 'pasta', 'pizza'],
+    'asian': ['asian', 'asiática', 'asiatica', 'asiático', 'asiatico'],
     'chinese': ['chinese', 'china', 'chino'],
     'japanese': ['japanese', 'japan', 'japonés', 'sushi', 'ramen'],
     'thai': ['thai', 'tailandés'],
@@ -1857,14 +2003,39 @@ export function extractInitialInfo(message: string): Partial<PlanContext> {
   if (!context.participants?.size) {
     let groupSize: number | undefined;
     
-    // Check for explicit number patterns first
-    const numberMatch = correctedMessage.match(/(\d+)\s*(people|person|personas?|gente)/i);
-    if (numberMatch) {
-      groupSize = parseInt(numberMatch[1]);
-    } else {
-      // Check for "my girlfriend/boyfriend/wife/husband" patterns (implies 2 people)
-      if (/(my|mi)\s*(girlfriend|boyfriend|wife|husband|novia|novio|esposa|esposo|pareja|partner)/i.test(lowerMessage)) {
-        groupSize = 2;
+    // Pattern 1: "just the two of us", "the two of us", "solo nosotros dos"
+    if (/\b(just\s+)?(the\s+)?two\s+of\s+us\b/i.test(lowerMessage) ||
+        /\b(solo|solamente)\s+(nosotros\s+)?dos\b/i.test(lowerMessage) ||
+        /\blos\s+dos\s+(solos|nada\s+más)\b/i.test(lowerMessage)) {
+      groupSize = 2;
+    }
+    // Pattern 2: "just us", "solo nosotros" (anniversary context suggests couple)
+    else if ((/\bjust\s+us\b/i.test(lowerMessage) || /\bsolo\s+nosotros\b/i.test(lowerMessage)) &&
+             (/anniversary|aniversario|date|cita|romantic|romántic/i.test(lowerMessage))) {
+      groupSize = 2;
+    }
+    // Pattern 3: "me and X friends/people" - need to add 1 for "me"
+    else {
+      const meAndPattern = correctedMessage.match(/(?:me|yo|i)\s+(?:and|y|con)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(friends?|amigos?|people|personas?)/i);
+      if (meAndPattern) {
+        const numberWord = meAndPattern[1].toLowerCase();
+        const numberMap: Record<string, number> = {
+          'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+          'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10
+        };
+        const friendsCount = numberMap[numberWord] || parseInt(meAndPattern[1]);
+        groupSize = friendsCount + 1; // +1 for "me"
+      }
+      // Pattern 4: Explicit number with people/person
+      else {
+        const numberMatch = correctedMessage.match(/(\d+)\s*(people|person|personas?|gente)/i);
+        if (numberMatch) {
+          groupSize = parseInt(numberMatch[1]);
+        }
+        // Pattern 5: "my girlfriend/boyfriend/wife/husband" patterns (implies 2 people)
+        else if (/(my|mi)\s*(girlfriend|boyfriend|wife|husband|novia|novio|esposa|esposo|pareja|partner)/i.test(lowerMessage)) {
+          groupSize = 2;
+        }
       }
     }
     

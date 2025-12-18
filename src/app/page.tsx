@@ -28,7 +28,7 @@ import {
   Place
 } from "@/modules/planning";
 import { deriveBlocks } from "@/lib/planner/deriveBlocks";
-import { getNextQuestion, hasAllRequiredInfo, parseUserResponse, getQuestionChips, QuestionKey, extractInitialInfo, validateTimeForToday, CONVERSATION_FLOW, detectChangeRequest } from "@/lib/conversation/flow";
+import { getNextQuestion, hasAllRequiredInfo, parseUserResponse, getQuestionChips, QuestionKey, extractInitialInfo, validateTimeForToday, CONVERSATION_FLOW, detectChangeRequest, isLocationValid, getLocationClarification } from "@/lib/conversation/flow";
 import { getCityFromCoordinates, getNearbyCities } from "@/lib/geo/reverseGeocode";
 import { 
   getWelcomeMessage, 
@@ -463,6 +463,7 @@ export default function Home() {
             startTime: { en: 'time', es: 'hora' },
             date: { en: 'date', es: 'fecha' },
             location: { en: 'location', es: 'ubicación' },
+            clarifyLocation: { en: 'location', es: 'ubicación' },
             budget: { en: 'budget', es: 'presupuesto' },
             duration: { en: 'duration', es: 'duración' },
             eventType: { en: 'event type', es: 'tipo de evento' },
@@ -763,6 +764,67 @@ export default function Home() {
         updatedContext = { ...context, ...updates };
         handleContextUpdate(updates);
         
+        // Check if location needs clarification (missing state/ZIP)
+        if (currentQuestion === "location" && updates.location?.text && updates.location.text !== "REQUEST_GEOLOCATION") {
+          if (!isLocationValid(updates.location.text)) {
+            // Location needs clarification - ask for state or ZIP
+            setCurrentQuestion("clarifyLocation");
+            
+            // Smart state suggestions based on detected city
+            const cityLower = updates.location.text.toLowerCase();
+            let stateChips = ["TX", "CA", "NY", "FL", "IL"]; // Default
+            
+            // Major cities mapping
+            const cityToState: Record<string, string[]> = {
+              'chicago': ["IL", "TX", "CA", "NY", "FL"],
+              'dallas': ["TX", "CA", "NY", "FL", "IL"],
+              'houston': ["TX", "CA", "NY", "FL", "IL"],
+              'austin': ["TX", "CA", "NY", "FL", "IL"],
+              'san antonio': ["TX", "CA", "NY", "FL", "IL"],
+              'los angeles': ["CA", "TX", "NY", "FL", "IL"],
+              'san francisco': ["CA", "TX", "NY", "FL", "IL"],
+              'san diego': ["CA", "TX", "NY", "FL", "IL"],
+              'new york': ["NY", "CA", "TX", "FL", "IL"],
+              'miami': ["FL", "CA", "TX", "NY", "IL"],
+              'orlando': ["FL", "CA", "TX", "NY", "IL"],
+              'seattle': ["WA", "CA", "TX", "NY", "FL"],
+              'portland': ["OR", "ME", "CA", "TX", "NY"],
+              'denver': ["CO", "CA", "TX", "NY", "FL"],
+              'phoenix': ["AZ", "CA", "TX", "NY", "FL"],
+              'atlanta': ["GA", "CA", "TX", "NY", "FL"],
+              'boston': ["MA", "CA", "TX", "NY", "FL"],
+            };
+            
+            // Check if city matches a known city
+            for (const [city, states] of Object.entries(cityToState)) {
+              if (cityLower.includes(city)) {
+                stateChips = states;
+                break;
+              }
+            }
+            
+            setCurrentChips(stateChips);
+            
+            // Store the incomplete city name temporarily
+            const tempLocation = {
+              ...updates.location,
+              _tempCity: updates.location.text,
+            };
+            setContext({ ...context, location: tempLocation });
+            
+            const clarificationMessage: Message = {
+              id: (Date.now() + 1).toString(),
+              role: "assistant",
+              content: getLocationClarification(updates.location.text, language),
+              timestamp: new Date(),
+            };
+            
+            setMessages((prev: Message[]) => [...prev, clarificationMessage]);
+            setIsLoadingResponse(false);
+            return;
+          }
+        }
+        
         // Add emotional response based on what was just updated
         let emotionalResponse: string | null = null;
         let emotionalResponseType: Message['dynamicType'] | undefined;
@@ -938,8 +1000,28 @@ export default function Home() {
           
           const messagesArr: Message[] = [];
           
-          // Add emotional response if we have one
-          if (emotionalResponse) {
+          // Add emotional response ONLY if it matches the next question context
+          // Avoid showing emotional responses that ask about different info
+          const shouldShowEmotional = emotionalResponse && (
+            // Show event type response only if asking about location next
+            (emotionalResponseType === 'eventType' && nextQuestion.key === 'location') ||
+            // Show location response only if asking about location
+            (emotionalResponseType === 'location' && nextQuestion.key === 'location') ||
+            // Show date response only if asking about date
+            (emotionalResponseType === 'date' && nextQuestion.key === 'date') ||
+            // Show time response only if asking about time
+            (emotionalResponseType === 'time' && nextQuestion.key === 'startTime') ||
+            // Show groupSize response only if asking about groupSize
+            (emotionalResponseType === 'groupSize' && nextQuestion.key === 'groupSize') ||
+            // Show budget response only if asking about budget
+            (emotionalResponseType === 'budget' && nextQuestion.key === 'budget') ||
+            // Show cuisine response only if asking about cuisine
+            (emotionalResponseType === 'cuisine' && nextQuestion.key === 'cuisine') ||
+            // Show mood response only if asking about mood
+            (emotionalResponseType === 'mood' && nextQuestion.key === 'mood')
+          );
+          
+          if (shouldShowEmotional && emotionalResponse) {
             messagesArr.push({
               id: (Date.now() + 1).toString(),
               role: "assistant",
@@ -1048,6 +1130,67 @@ export default function Home() {
         const updatedContext = { ...context, ...extractedInfo };
         handleContextUpdate(extractedInfo);
         
+        // Check if location needs clarification (missing state/ZIP)
+        if (extractedInfo.location?.text && extractedInfo.location.text !== "REQUEST_GEOLOCATION") {
+          if (!isLocationValid(extractedInfo.location.text)) {
+            // Location needs clarification - ask for state or ZIP
+            setCurrentQuestion("clarifyLocation");
+            
+            // Smart state suggestions based on detected city
+            const cityLower = extractedInfo.location.text.toLowerCase();
+            let stateChips = ["TX", "CA", "NY", "FL", "IL"]; // Default
+            
+            // Major cities mapping
+            const cityToState: Record<string, string[]> = {
+              'chicago': ["IL", "TX", "CA", "NY", "FL"],
+              'dallas': ["TX", "CA", "NY", "FL", "IL"],
+              'houston': ["TX", "CA", "NY", "FL", "IL"],
+              'austin': ["TX", "CA", "NY", "FL", "IL"],
+              'san antonio': ["TX", "CA", "NY", "FL", "IL"],
+              'los angeles': ["CA", "TX", "NY", "FL", "IL"],
+              'san francisco': ["CA", "TX", "NY", "FL", "IL"],
+              'san diego': ["CA", "TX", "NY", "FL", "IL"],
+              'new york': ["NY", "CA", "TX", "FL", "IL"],
+              'miami': ["FL", "CA", "TX", "NY", "IL"],
+              'orlando': ["FL", "CA", "TX", "NY", "IL"],
+              'seattle': ["WA", "CA", "TX", "NY", "FL"],
+              'portland': ["OR", "ME", "CA", "TX", "NY"],
+              'denver': ["CO", "CA", "TX", "NY", "FL"],
+              'phoenix': ["AZ", "CA", "TX", "NY", "FL"],
+              'atlanta': ["GA", "CA", "TX", "NY", "FL"],
+              'boston': ["MA", "CA", "TX", "NY", "FL"],
+            };
+            
+            // Check if city matches a known city
+            for (const [city, states] of Object.entries(cityToState)) {
+              if (cityLower.includes(city)) {
+                stateChips = states;
+                break;
+              }
+            }
+            
+            setCurrentChips(stateChips);
+            
+            // Store the incomplete city name temporarily
+            const tempLocation = {
+              ...extractedInfo.location,
+              _tempCity: extractedInfo.location.text,
+            };
+            setContext({ ...context, ...extractedInfo, location: tempLocation });
+            
+            const clarificationMessage: Message = {
+              id: (Date.now() + 1).toString(),
+              role: "assistant",
+              content: getLocationClarification(extractedInfo.location.text, language),
+              timestamp: new Date(),
+            };
+            
+            setMessages((prev: Message[]) => [...prev, clarificationMessage]);
+            setIsLoadingResponse(false);
+            return;
+          }
+        }
+        
         // Add emotional response based on what was extracted
         let emotionalResponse: string | null = null;
         let emotionalResponseType: Message['dynamicType'] | undefined;
@@ -1152,8 +1295,16 @@ export default function Home() {
           
           const messagesArr: Message[] = [];
           
-          // Add emotional response if we have one
-          if (emotionalResponse) {
+          // Add emotional response ONLY if it matches the next question context
+          // Avoid showing emotional responses that ask about info we already have
+          const shouldShowEmotional = emotionalResponse && (
+            // Show event type response only if we're still asking about related info early in conversation
+            (emotionalResponseType === 'eventType' && !updatedContext.location?.text) ||
+            // Show location response only if we're asking about location
+            (emotionalResponseType === 'location' && nextQuestion.key === 'location')
+          );
+          
+          if (shouldShowEmotional && emotionalResponse) {
             messagesArr.push({
               id: (Date.now() + 1).toString(),
               role: "assistant",
@@ -1671,7 +1822,15 @@ setMessages((prev: Message[]) => [...prev, ...messagesArr]);
               "Content-Type": "application/json",
             },
             body: JSON.stringify({
-              context,
+              context: {
+                ...context,
+                event: {
+                  ...context.event,
+                  // Override with block-specific times
+                  startTime: block.startTime,
+                  endTime: block.endTime,
+                }
+              },
               blockType: block.type,
               language: language,
               limit: 3,
@@ -1712,8 +1871,76 @@ setMessages((prev: Message[]) => [...prev, ...messagesArr]);
     setIsLoadingPlan(false);
   };
 
+  // Helper function to reload options for blocks with updated times
+  const reloadBlockOptions = async (blocks: PlanBlock[]) => {
+    // Mark blocks as loading
+    const loadingBlocks = blocks.map(block => ({
+      ...block,
+      isLoading: true,
+    }));
+    setPlanBlocks(loadingBlocks);
+
+    // Fetch new recommendations for each block with updated times
+    const updatedBlocks = await Promise.all(
+      blocks.map(async (block) => {
+        try {
+          const response = await fetch("/api/yelp/recommendations", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              context: {
+                ...context,
+                event: {
+                  ...context.event,
+                  // Use block-specific times
+                  startTime: block.startTime,
+                  endTime: block.endTime,
+                }
+              },
+              blockType: block.type,
+              language: language,
+              limit: 3,
+            }),
+          });
+
+          if (response.ok) {
+            const data = await response.json();
+            const options = data.places || [];
+            return {
+              ...block,
+              options,
+              isLoading: false,
+              hasError: options.length === 0,
+            };
+          } else {
+            return {
+              ...block,
+              isLoading: false,
+              hasError: true,
+            };
+          }
+        } catch (error) {
+          console.error(`Error reloading options for ${block.type}:`, error);
+          return {
+            ...block,
+            isLoading: false,
+            hasError: true,
+          };
+        }
+      })
+    );
+
+    setPlanBlocks(updatedBlocks);
+  };
+
   const handleReorder = (newBlocks: PlanBlock[]) => {
+    // First update the blocks with new times
     setPlanBlocks(newBlocks);
+    
+    // Then reload options with the new times
+    reloadBlockOptions(newBlocks);
   };
 
   const handleUndoSwap = () => {

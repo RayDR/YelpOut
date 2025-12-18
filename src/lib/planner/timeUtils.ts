@@ -5,28 +5,50 @@
 import { PlanBlock } from "@/modules/planning/types";
 
 /**
- * Parse time string "HH:MM AM/PM" to minutes since midnight
+ * Parse time string to minutes since midnight
+ * Handles both "HH:MM AM/PM" and "HH:MM" (24h) formats
  */
 export function parseTimeToMinutes(timeStr: string): number {
-  const match = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
-  if (!match) return 0;
+  // Try 12-hour format first (HH:MM AM/PM)
+  const match12h = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
+  if (match12h) {
+    let hours = parseInt(match12h[1]);
+    const minutes = parseInt(match12h[2]);
+    const period = match12h[3].toUpperCase();
+    
+    if (period === 'PM' && hours !== 12) hours += 12;
+    if (period === 'AM' && hours === 12) hours = 0;
+    
+    return hours * 60 + minutes;
+  }
   
-  let hours = parseInt(match[1]);
-  const minutes = parseInt(match[2]);
-  const period = match[3].toUpperCase();
+  // Try 24-hour format (HH:MM)
+  const match24h = timeStr.match(/(\d+):(\d+)/);
+  if (match24h) {
+    const hours = parseInt(match24h[1]);
+    const minutes = parseInt(match24h[2]);
+    return hours * 60 + minutes;
+  }
   
-  if (period === 'PM' && hours !== 12) hours += 12;
-  if (period === 'AM' && hours === 12) hours = 0;
-  
-  return hours * 60 + minutes;
+  return 0;
 }
 
 /**
- * Format minutes since midnight to "HH:MM AM/PM"
+ * Format minutes since midnight to "HH:MM" (24-hour format)
  */
 export function formatMinutesToTime(minutes: number): string {
-  const hours = Math.floor(minutes / 60);
-  const mins = minutes % 60;
+  const hours = Math.floor(minutes / 60) % 24;
+  const mins = Math.round(minutes % 60);
+  
+  return `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Format minutes since midnight to "HH:MM AM/PM" (12-hour format)
+ */
+export function formatMinutesToTime12h(minutes: number): string {
+  const hours = Math.floor(minutes / 60) % 24;
+  const mins = Math.round(minutes % 60);
   const period = hours >= 12 ? 'PM' : 'AM';
   const displayHours = hours === 0 ? 12 : hours > 12 ? hours - 12 : hours;
   
@@ -117,4 +139,36 @@ export function shouldRemoveBlock(block: PlanBlock): boolean {
   
   // Remove if activity would exceed closing time
   return isClosed || minutesUntilClose < block.durationMinutes;
+}
+
+/**
+ * Normalize time to 24-hour format (HH:MM)
+ * Accepts both "HH:MM AM/PM" and "HH:MM" formats
+ * Always returns "HH:MM" in 24-hour format
+ */
+export function normalizeTimeTo24h(timeStr: string): string {
+  // Already in 24h format? Check if it has AM/PM
+  if (!/AM|PM/i.test(timeStr)) {
+    // Ensure proper formatting
+    const match = timeStr.match(/(\d+):(\d+)/);
+    if (match) {
+      const hours = parseInt(match[1]);
+      const minutes = parseInt(match[2]);
+      return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+    }
+    return timeStr; // Return as-is if can't parse
+  }
+  
+  // Convert from 12h to 24h
+  const match = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
+  if (!match) return timeStr; // Return as-is if can't parse
+  
+  let hours = parseInt(match[1]);
+  const minutes = parseInt(match[2]);
+  const period = match[3].toUpperCase();
+  
+  if (period === 'PM' && hours !== 12) hours += 12;
+  if (period === 'AM' && hours === 12) hours = 0;
+  
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
 }
