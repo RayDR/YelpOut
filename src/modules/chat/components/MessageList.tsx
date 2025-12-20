@@ -150,7 +150,6 @@ export default function MessageList({
                   onClick={onShowPlan}
                   className="mt-3 px-4 py-2 bg-gradient-to-r from-primary-600 to-purple-600 hover:from-primary-700 hover:to-purple-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg transition-all flex items-center gap-2"
                 >
-                  <span>📝</span>
                   <span>{t('plan.viewPlan') || 'Ver Plan'}</span>
                 </motion.button>
               )}

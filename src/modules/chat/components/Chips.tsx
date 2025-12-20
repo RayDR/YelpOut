@@ -69,6 +69,12 @@ export default function Chips({ options, onSelect, context }: ChipsProps) {
         }
         // Otherwise use the value as-is (city names, literal values, etc.)
 
+        // Special styling for viewUpdatedPlan chip to make it stand out
+        const isViewUpdatedPlan = option === 'chips.viewUpdatedPlan';
+        const chipClassName = isViewUpdatedPlan
+          ? "inline-flex items-center gap-2 px-4 py-2.5 bg-primary-600 dark:bg-primary-500 text-white hover:bg-primary-700 dark:hover:bg-primary-600 rounded-full font-medium transition-all shadow-md hover:shadow-lg"
+          : "inline-flex items-center gap-2 px-4 py-2.5 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 border-2 border-gray-200 dark:border-gray-700 hover:border-primary-500 dark:hover:border-primary-400 hover:bg-primary-50 dark:hover:bg-primary-900/20 rounded-full font-medium transition-all shadow-sm hover:shadow-md";
+
         return (
           <motion.button
             key={option}
@@ -78,9 +84,9 @@ export default function Chips({ options, onSelect, context }: ChipsProps) {
             whileHover={{ scale: 1.05 }}
             whileTap={{ scale: 0.95 }}
             onClick={() => onSelect(option)}
-            className="inline-flex items-center gap-2 px-4 py-2.5 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 border-2 border-gray-200 dark:border-gray-700 hover:border-primary-500 dark:hover:border-primary-400 hover:bg-primary-50 dark:hover:bg-primary-900/20 rounded-full font-medium transition-all shadow-sm hover:shadow-md"
+            className={chipClassName}
           >
-            {icon && (
+            {icon && !isViewUpdatedPlan && (
               <span className="text-primary-600 dark:text-primary-400">
                 {icon}
               </span>

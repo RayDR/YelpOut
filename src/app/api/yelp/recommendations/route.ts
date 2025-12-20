@@ -53,9 +53,35 @@ export async function POST(request: NextRequest) {
     searchParams.limit = Math.min(50, limit + excludeIds.length + 10);
     
     // Log the search params for debugging
+    console.log('[Yelp API] Search params:', JSON.stringify(searchParams, null, 2));
+    console.log('[Yelp API] Request details:', {
+      blockType: blockType,
+      mood: context.preferences?.mood,
+      cuisine: context.preferences?.cuisine,
+      hasAttributes: !!searchParams.attributes,
+      hasTerm: !!searchParams.term,
+      hasCategories: !!searchParams.categories
+    });
 
     // Execute search
-    const yelpResponse = await yelpClient.searchBusinesses(searchParams);
+    let yelpResponse = await yelpClient.searchBusinesses(searchParams);
+    
+    // If no results and we have restrictive attributes, try without them
+    if (yelpResponse.businesses.length === 0 && searchParams.attributes) {
+      console.log('[Yelp Fallback] No results with attributes, retrying without:', searchParams.attributes);
+      const fallbackParams = { ...searchParams };
+      delete fallbackParams.attributes;
+      yelpResponse = await yelpClient.searchBusinesses(fallbackParams);
+    }
+    
+    // If still no results and we have a specific term, try with broader categories only
+    if (yelpResponse.businesses.length === 0 && searchParams.term) {
+      console.log('[Yelp Fallback] No results with term, retrying with categories only');
+      const fallbackParams = { ...searchParams };
+      delete fallbackParams.term;
+      delete fallbackParams.attributes;
+      yelpResponse = await yelpClient.searchBusinesses(fallbackParams);
+    }
 
     // Normalize results to our internal format
     let places = yelpResponse.businesses

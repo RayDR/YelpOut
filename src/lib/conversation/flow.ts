@@ -20,7 +20,8 @@ export type QuestionKey =
   | "startTime"
   | "duration"
   | "clarifyAmPm"
-  | "refine";
+  | "refine"
+  | "confirmRestart";
 
 export interface ConversationQuestion {
   key: QuestionKey;
@@ -1259,6 +1260,45 @@ export function parseUserResponse(
         }
       }
       break;
+
+    case "refine":
+      // When refining, automatically detect what the user wants to change
+      // Try to extract date first
+      const refinedDate = extractDate(message);
+      if (refinedDate) {
+        updates.event = {
+          ...context.event,
+          dateISO: refinedDate,
+        };
+      }
+      
+      // Try to extract time
+      const refinedTimeResult = extractTime(message);
+      if (refinedTimeResult.time) {
+        if (refinedTimeResult.needsClarification) {
+          updates.event = {
+            ...context.event,
+            startTime: "NEEDS_CLARIFICATION",
+            _tempHour: refinedTimeResult.tempHour,
+            _tempMinutes: refinedTimeResult.tempMinutes,
+          };
+        } else {
+          updates.event = {
+            ...context.event,
+            startTime: refinedTimeResult.time,
+          };
+        }
+      }
+      
+      // Try to extract location
+      const refinedLocation = extractLocation(message);
+      if (refinedLocation) {
+        updates.location = {
+          text: refinedLocation,
+          radiusKm: 15,
+        };
+      }
+      break;
   }
 
   return updates;
@@ -1671,37 +1711,50 @@ function extractLocation(message: string): string | null {
     }
   }
   
-  // 3. Look for area prefixes (downtown, north, south, etc.) with city names
+  // 3. Explicit city patterns with state (most reliable) - MUST BE CHECKED FIRST
+  const cityWithStatePatterns = [
+    /\b(?:in|en|at|a)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*),\s*([A-Z]{2})\b/i, // "in City, ST"
+    /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*),\s*([A-Z]{2})\b/i, // City, ST format (e.g., "Austin, TX")
+  ];
+  
+  for (const pattern of cityWithStatePatterns) {
+    const match = message.match(pattern);
+    if (match) {
+      // For patterns with capture groups, construct "City, ST"
+      if (match[2]) {
+        return `${match[1]}, ${match[2]}`;
+      }
+      return match[1];
+    }
+  }
+  
+  // 4. Look for area prefixes (downtown, north, south, etc.) with city names
+  // Check if there's a state after the city name
   const areaPrefixPatterns = [
-    /\b(?:in|en)\s+(downtown|uptown|midtown|north|south|east|west|central)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i,
-    /\b(downtown|uptown|midtown|north|south|east|west|central)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i,
+    /\b(?:downtown|uptown|midtown|north|south|east|west|central)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*),\s*([A-Z]{2})\b/i, // with state
+    /\b(?:downtown|uptown|midtown|north|south|east|west|central)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/i, // without state
   ];
   
   for (const pattern of areaPrefixPatterns) {
     const match = message.match(pattern);
     if (match) {
-      const area = match[1];
-      const city = match[2];
-      // Return as "City" - the area prefix is context but we want the city name
-      return city;
-    }
-  }
-  
-  // 4. Explicit city patterns with state (most reliable)
-  const cityPatterns = [
-    /\b(?:in|en)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z]{2})\b/i,
-    /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z]{2})\b/i, // City, ST format
-    /\b(?:in|en)\s+(San\s+[A-Z][a-z]+|New\s+[A-Z][a-z]+|Los\s+Angeles|Las\s+Vegas|Fort\s+Worth|El\s+Paso)\b/i,
-  ];
-  
-  for (const pattern of cityPatterns) {
-    const match = message.match(pattern);
-    if (match) {
+      // If we have a state (group 2), return "City, ST"
+      if (match[2]) {
+        return `${match[1]}, ${match[2]}`;
+      }
+      // Otherwise just return city name
       return match[1];
     }
   }
   
-  // 5. Look for common city names (without state) - accept any reasonable city name
+  // 5. Multi-word city names (Las Vegas, New York, San Francisco, etc.)
+  const multiWordCityPattern = /\b(?:in|en|at|a)\s+(San\s+[A-Z][a-z]+|New\s+[A-Z][a-z]+|Los\s+Angeles|Las\s+Vegas|Fort\s+Worth|El\s+Paso)\b/i;
+  const multiCityMatch = message.match(multiWordCityPattern);
+  if (multiCityMatch) {
+    return multiCityMatch[1];
+  }
+  
+  // 6. Look for common city names (without state) - accept any reasonable city name
   // This allows flexibility for users to just say "Dallas" or "New York"
   // Priority patterns: "in CityName" format
   const cityInPattern = /\b(?:in|en|at|a)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b(?!\s+with|\s+for|\s+about|\s+,)/i;
@@ -1751,9 +1804,9 @@ export function isLocationValid(locationText: string): boolean {
  */
 export function getLocationClarification(cityName: string, language: string = 'en'): string {
   if (language === 'es') {
-    return `Encontré "${cityName}" pero necesito más información. ¿En qué estado está? (ejemplo: TX, CA, NY) o proporciona un código postal.`;
+    return `Encontré "${cityName}" pero necesito más información. ¿En qué estado está? (ejemplo: TX, CA, NY).`;
   }
-  return `I found "${cityName}" but need more details. What state is it in? (e.g., TX, CA, NY) or provide a ZIP code.`;
+  return `I found "${cityName}" but need more details. What state is it in? (e.g., TX, CA, NY).`;
 }
 
 // Main extraction function

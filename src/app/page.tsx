@@ -7,6 +7,7 @@ import { FiRefreshCw, FiArrowLeft } from "react-icons/fi";
 // Modular imports
 import { useAppStore, useToast } from "@/shared";
 import { useTranslation } from "@/lib/i18n/useTranslation";
+import { translations } from "@/lib/i18n/translations";
 import { Header } from "@/shared";
 import { 
   MessageList, 
@@ -29,6 +30,7 @@ import {
 } from "@/modules/planning";
 import { deriveBlocks } from "@/lib/planner/deriveBlocks";
 import { getNextQuestion, hasAllRequiredInfo, parseUserResponse, getQuestionChips, QuestionKey, extractInitialInfo, validateTimeForToday, CONVERSATION_FLOW, detectChangeRequest, isLocationValid, getLocationClarification } from "@/lib/conversation/flow";
+import { validatePlanContext, formatGroupDisplay } from "@/lib/conversation/validators";
 import { getCityFromCoordinates, getNearbyCities } from "@/lib/geo/reverseGeocode";
 import { 
   getWelcomeMessage, 
@@ -63,6 +65,7 @@ export default function Home() {
   const [planBlocks, setPlanBlocks] = useState<PlanBlock[]>([]);
   const [showPlan, setShowPlan] = useState(false);
   const [isLoadingPlan, setIsLoadingPlan] = useState(false);
+  const [validationRetries, setValidationRetries] = useState<Record<string, number>>({});
   const [viewingAlternatives, setViewingAlternatives] = useState<Record<string, boolean>>({});
   const [conversationHistory, setConversationHistory] = useState<ConversationStep[]>([]);
   const [currentChips, setCurrentChips] = useState<string[]>([]);
@@ -385,6 +388,41 @@ export default function Home() {
       return; // Don't process as regular message
     }
     
+    // Detect restart/start over commands (but NOT if we're already confirming restart)
+    const restartKeywords = [
+      /\b(start over|restart|reset|comenzar de nuevo|empezar de nuevo|volver a empezar|reiniciar|empezar otra vez|volver al inicio|nueva conversaci[oó]n|new conversation)\b/i,
+    ];
+    
+    const isRestartRequest = restartKeywords.some(pattern => pattern.test(message.trim()));
+    
+    if (isRestartRequest && currentQuestion !== "confirmRestart") {
+      // Ask for confirmation
+      saveConversationStep();
+      
+      const userMessage: Message = {
+        id: Date.now().toString(),
+        role: "user",
+        content: message,
+        timestamp: new Date(),
+      };
+      
+      const confirmMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: "assistant",
+        content: "confirmRestart",
+        translationKey: "chat.confirmRestart",
+        timestamp: new Date(),
+      };
+      
+      setMessages([...messages, userMessage, confirmMessage]);
+      setCurrentQuestion("confirmRestart" as QuestionKey);
+      setCurrentChips([
+        language === 'en' ? 'Yes, start over' : 'Sí, empezar de nuevo',
+        language === 'en' ? 'No, continue' : 'No, continuar'
+      ]);
+      return;
+    }
+    
     // Detect help keywords in multiple languages and variations
     const helpKeywords = [
       // English
@@ -474,6 +512,7 @@ export default function Home() {
             mood: { en: 'mood', es: 'ambiente' },
             clarifyAmPm: { en: 'time', es: 'hora' },
             refine: { en: 'preferences', es: 'preferencias' },
+            confirmRestart: { en: 'restart', es: 'reinicio' },
           };
           
           const fieldName = fieldNames[changeRequest.field]?.[language] || changeRequest.field;
@@ -526,6 +565,41 @@ export default function Home() {
             }
           }
           
+          setIsLoadingResponse(false);
+          return;
+        }
+      }
+      
+      // Handle restart confirmation FIRST, before checking isFirstMessage
+      if (currentQuestion === "confirmRestart") {
+        const normalizedResponse = message.toLowerCase().trim();
+        const isYes = normalizedResponse.includes('yes') || 
+                      normalizedResponse.includes('sí') || 
+                      normalizedResponse.includes('si') ||
+                      normalizedResponse.includes('empezar') ||
+                      normalizedResponse.includes('start');
+        const isNo = normalizedResponse.includes('no') || 
+                     normalizedResponse.includes('continuar') ||
+                     normalizedResponse.includes('continue');
+        
+        if (isYes && !isNo) {
+          // User confirmed restart
+          handleRestart();
+          setIsLoadingResponse(false);
+          return;
+        } else {
+          // User cancelled restart or unclear, continue where they were
+          const continueMessage: Message = {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content: language === 'en' 
+              ? "No problem! Let's continue where we left off."
+              : "¡No hay problema! Continuemos donde lo dejamos.",
+            timestamp: new Date(),
+          };
+          
+          setMessages((prev: Message[]) => [...prev, continueMessage]);
+          setCurrentQuestion(null); // Clear confirm question
           setIsLoadingResponse(false);
           return;
         }
@@ -764,6 +838,35 @@ export default function Home() {
         updatedContext = { ...context, ...updates };
         handleContextUpdate(updates);
         
+        // If we're refining, ask if they want to change anything else
+        if (isRefining) {
+          const refineMoreMessage: Message = {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content: "Got it! Want to change anything else?",
+            translationKey: "chat.refineMore",
+            timestamp: new Date(),
+          };
+          setMessages((prev: Message[]) => [...prev, refineMoreMessage]);
+          
+          // Show refine chips + "View Updated Plan" button
+          const refineChips = [
+            "chips.viewUpdatedPlan",
+            "chips.refineLocation",
+            "chips.refineDate",
+            "chips.refineTime",
+            "chips.refineGroup",
+            "chips.refineBudget",
+            "chips.refineCuisine",
+            "chips.refineMood",
+            "chips.refineDuration"
+          ];
+          setCurrentChips(refineChips);
+          setCurrentQuestion("refine");
+          setIsLoadingResponse(false);
+          return;
+        }
+        
         // Check if location needs clarification (missing state/ZIP)
         if (currentQuestion === "location" && updates.location?.text && updates.location.text !== "REQUEST_GEOLOCATION") {
           if (!isLocationValid(updates.location.text)) {
@@ -826,98 +929,101 @@ export default function Home() {
         }
         
         // Add emotional response based on what was just updated
+        // Only generate emotional responses if not in refining mode
         let emotionalResponse: string | null = null;
         let emotionalResponseType: Message['dynamicType'] | undefined;
         let emotionalResponseParams: any = {};
         
-        if (currentQuestion === "eventType" && updates.event?.type) {
-          emotionalResponse = getEventTypeResponse(updates.event.type, language);
-          emotionalResponseType = 'eventType';
-          emotionalResponseParams = { eventType: updates.event.type };
-        } else if (currentQuestion === "location" && updates.location?.text) {
-          emotionalResponse = getLocationResponse(language);
-          emotionalResponseType = 'location';
-        } else if (currentQuestion === "date" && updates.event?.dateISO) {
-          // Add T00:00:00 to ensure proper local date parsing
-          const date = new Date(updates.event.dateISO + 'T00:00:00');
-          const today = new Date();
-          today.setHours(0, 0, 0, 0); // Reset to midnight for accurate comparison
-          
-          const tomorrow = new Date(today);
-          tomorrow.setDate(tomorrow.getDate() + 1);
-          
-          const dateOnly = new Date(date);
-          dateOnly.setHours(0, 0, 0, 0);
-          
-          const dayOfWeek = date.getDay();
-          
-          let dateType: 'today' | 'tomorrow' | 'future' | 'weekend';
-          if (dateOnly.getTime() === today.getTime()) {
-            dateType = 'today';
-          } else if (dateOnly.getTime() === tomorrow.getTime()) {
-            dateType = 'tomorrow';
-          } else if (dayOfWeek === 0 || dayOfWeek === 6) {
-            dateType = 'weekend';
-          } else {
-            dateType = 'future';
+        if (!isRefining) {
+          if (currentQuestion === "eventType" && updates.event?.type) {
+            emotionalResponse = getEventTypeResponse(updates.event.type, language);
+            emotionalResponseType = 'eventType';
+            emotionalResponseParams = { eventType: updates.event.type };
+          } else if (currentQuestion === "location" && updates.location?.text) {
+            emotionalResponse = getLocationResponse(language);
+            emotionalResponseType = 'location';
+          } else if (currentQuestion === "date" && updates.event?.dateISO) {
+            // Add T00:00:00 to ensure proper local date parsing
+            const date = new Date(updates.event.dateISO + 'T00:00:00');
+            const today = new Date();
+            today.setHours(0, 0, 0, 0); // Reset to midnight for accurate comparison
+            
+            const tomorrow = new Date(today);
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            
+            const dateOnly = new Date(date);
+            dateOnly.setHours(0, 0, 0, 0);
+            
+            const dayOfWeek = date.getDay();
+            
+            let dateType: 'today' | 'tomorrow' | 'future' | 'weekend';
+            if (dateOnly.getTime() === today.getTime()) {
+              dateType = 'today';
+            } else if (dateOnly.getTime() === tomorrow.getTime()) {
+              dateType = 'tomorrow';
+            } else if (dayOfWeek === 0 || dayOfWeek === 6) {
+              dateType = 'weekend';
+            } else {
+              dateType = 'future';
+            }
+            
+            emotionalResponse = getDateResponse(dateType, language);
+            emotionalResponseType = 'date';
+            emotionalResponseParams = { dateType };
+          } else if (currentQuestion === "startTime" && updates.event?.startTime) {
+            const hour = parseInt(updates.event.startTime.split(':')[0]);
+            let timeSlot: 'morning' | 'afternoon' | 'evening' | 'night';
+            if (hour >= 6 && hour < 12) timeSlot = 'morning';
+            else if (hour >= 12 && hour < 18) timeSlot = 'afternoon';
+            else if (hour >= 18 && hour < 22) timeSlot = 'evening';
+            else timeSlot = 'night';
+            emotionalResponse = getTimeResponse(timeSlot, language);
+            emotionalResponseType = 'time';
+            emotionalResponseParams = { timeSlot };
+          } else if (currentQuestion === "groupSize" && updates.participants?.size) {
+            const size = updates.participants.size;
+            let groupType: 'solo' | 'couple' | 'small' | 'medium' | 'large';
+            if (size === 1) groupType = 'solo';
+            else if (size === 2) groupType = 'couple';
+            else if (size <= 4) groupType = 'small';
+            else if (size <= 8) groupType = 'medium';
+            else groupType = 'large';
+            // Pass event type for contextual 2-person messages
+            const eventType = updatedContext.event?.type;
+            emotionalResponse = getGroupSizeResponse(groupType, language, eventType);
+            emotionalResponseType = 'groupSize';
+            emotionalResponseParams = { size: groupType };
+            
+            // After groupSize, show participant checkboxes instead of continuing
+            if (emotionalResponse) {
+              const emotionalMessage: Message = {
+                id: (Date.now() + 1).toString(),
+                role: "assistant",
+                content: emotionalResponse,
+                timestamp: new Date(),
+                isDynamic: true,
+                dynamicType: emotionalResponseType,
+                dynamicParams: emotionalResponseParams,
+              };
+              setMessages((prev: Message[]) => [...prev, emotionalMessage]);
+            }
+            
+            setShowParticipantCheckboxes(true);
+            setIsLoadingResponse(false);
+            return;
+          } else if (currentQuestion === "budget" && updates.budget?.tier) {
+            const budgetType = updates.budget.tier === 'NA' ? 'flexible' : 'specific';
+            emotionalResponse = getBudgetResponse(budgetType, language);
+            emotionalResponseType = 'budget';
+            emotionalResponseParams = { type: budgetType };
+          } else if (currentQuestion === "cuisine" && updates.preferences?.cuisine) {
+            emotionalResponse = getCuisineResponse(language);
+            emotionalResponseType = 'cuisine';
+          } else if (currentQuestion === "mood" && updates.preferences?.mood) {
+            emotionalResponse = getMoodResponse(language);
+            emotionalResponseType = 'mood';
           }
-          
-          emotionalResponse = getDateResponse(dateType, language);
-          emotionalResponseType = 'date';
-          emotionalResponseParams = { dateType };
-        } else if (currentQuestion === "startTime" && updates.event?.startTime) {
-          const hour = parseInt(updates.event.startTime.split(':')[0]);
-          let timeSlot: 'morning' | 'afternoon' | 'evening' | 'night';
-          if (hour >= 6 && hour < 12) timeSlot = 'morning';
-          else if (hour >= 12 && hour < 18) timeSlot = 'afternoon';
-          else if (hour >= 18 && hour < 22) timeSlot = 'evening';
-          else timeSlot = 'night';
-          emotionalResponse = getTimeResponse(timeSlot, language);
-          emotionalResponseType = 'time';
-          emotionalResponseParams = { timeSlot };
-        } else if (currentQuestion === "groupSize" && updates.participants?.size) {
-          const size = updates.participants.size;
-          let groupType: 'solo' | 'couple' | 'small' | 'medium' | 'large';
-          if (size === 1) groupType = 'solo';
-          else if (size === 2) groupType = 'couple';
-          else if (size <= 4) groupType = 'small';
-          else if (size <= 8) groupType = 'medium';
-          else groupType = 'large';
-          // Pass event type for contextual 2-person messages
-          const eventType = updatedContext.event?.type;
-          emotionalResponse = getGroupSizeResponse(groupType, language, eventType);
-          emotionalResponseType = 'groupSize';
-          emotionalResponseParams = { size: groupType };
-          
-          // After groupSize, show participant checkboxes instead of continuing
-          if (emotionalResponse) {
-            const emotionalMessage: Message = {
-              id: (Date.now() + 1).toString(),
-              role: "assistant",
-              content: emotionalResponse,
-              timestamp: new Date(),
-              isDynamic: true,
-              dynamicType: emotionalResponseType,
-              dynamicParams: emotionalResponseParams,
-            };
-            setMessages((prev: Message[]) => [...prev, emotionalMessage]);
-          }
-          
-          setShowParticipantCheckboxes(true);
-          setIsLoadingResponse(false);
-          return;
-        } else if (currentQuestion === "budget" && updates.budget?.tier) {
-          const budgetType = updates.budget.tier === 'NA' ? 'flexible' : 'specific';
-          emotionalResponse = getBudgetResponse(budgetType, language);
-          emotionalResponseType = 'budget';
-          emotionalResponseParams = { type: budgetType };
-        } else if (currentQuestion === "cuisine" && updates.preferences?.cuisine) {
-          emotionalResponse = getCuisineResponse(language);
-          emotionalResponseType = 'cuisine';
-        } else if (currentQuestion === "mood" && updates.preferences?.mood) {
-          emotionalResponse = getMoodResponse(language);
-          emotionalResponseType = 'mood';
-        }
+        } // End of if (!isRefining)
         
         // Check if we need AM/PM clarification
         if (currentQuestion === "startTime" && updatedContext.event?.startTime === "NEEDS_CLARIFICATION") {
@@ -941,8 +1047,8 @@ export default function Home() {
         // Check if we have all required info
         if (hasAllRequiredInfo(updatedContext)) {
           
-          // Show emotional response if we have one (only if not refining)
-          if (emotionalResponse && !isRefining) {
+          // Show emotional response if we have one
+          if (emotionalResponse) {
             const emotionalMessage: Message = {
               id: (Date.now() + 1).toString(),
               role: "assistant",
@@ -953,16 +1059,6 @@ export default function Home() {
               dynamicParams: emotionalResponseParams,
             };
             setMessages((prev: Message[]) => [...prev, emotionalMessage]);
-          }
-          
-          // If we're refining, regenerate plan immediately
-          if (isRefining) {
-            setCurrentChips([]);
-            setCurrentQuestion(null);
-            setIsLoadingResponse(false);
-            setIsRefining(false);
-            handlePlanReady();
-            return;
           }
           
           const completeMessage: Message = {
@@ -1336,6 +1432,15 @@ setMessages((prev: Message[]) => [...prev, ...messagesArr]);
 
   const handleChipSelect = (chip: string) => {
     
+    // Special handling for "View Updated Plan" during refinement
+    if (chip === "chips.viewUpdatedPlan") {
+      setIsRefining(false);
+      setCurrentChips([]);
+      setCurrentQuestion(null);
+      handlePlanReady();
+      return;
+    }
+    
     // Check if "Choose date" chip was clicked
     if (chip === "chips.chooseDate") {
       setShowDatePicker(true);
@@ -1441,8 +1546,9 @@ setMessages((prev: Message[]) => [...prev, ...messagesArr]);
       
       const refineConfig = refineMap[chip];
       if (refineConfig) {
+        // Change currentQuestion temporarily so parseUserResponse works correctly
         setCurrentQuestion(refineConfig.question);
-        // Get chips from flow or use provided ones
+        // Show the chips for the selected refinement
         if (refineConfig.chips.length === 0) {
           const questionObj = CONVERSATION_FLOW.find(q => q.key === refineConfig.question);
           if (questionObj) {
@@ -1581,56 +1687,88 @@ setMessages((prev: Message[]) => [...prev, ...messagesArr]);
       const updates = parseUserResponse(dateISO, currentQuestion, context);
       
       const updatedContext = { ...context, ...updates };
+      setContext(updatedContext);
       handleContextUpdate(updates);
       
-      // Add emotional response for date selection
-      const dateObj = new Date(dateISO + 'T00:00:00');
-      const today = new Date();
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      const dayOfWeek = dateObj.getDay();
-      
-      let dateType: 'today' | 'tomorrow' | 'future' | 'weekend';
-      if (dateObj.toDateString() === today.toDateString()) {
-        dateType = 'today';
-      } else if (dateObj.toDateString() === tomorrow.toDateString()) {
-        dateType = 'tomorrow';
-      } else if (dayOfWeek === 0 || dayOfWeek === 6) {
-        dateType = 'weekend';
-      } else {
-        dateType = 'future';
-      }
-      
-      const emotionalResponse = getDateResponse(dateType, language);
-      
-      if (emotionalResponse) {
-        const emotionalMessage: Message = {
+      // Handle refining mode
+      if (isRefining) {
+        // Show refine more message
+        const refineMoreMessage: Message = {
           id: (Date.now() + 1).toString(),
           role: "assistant",
-          content: emotionalResponse,
-          timestamp: new Date(),
-          isDynamic: true,
-          dynamicType: 'date',
-          dynamicParams: { dateType },
-        };
-        setMessages(prev => [...prev, emotionalMessage]);
-      }
-      
-      // Move to next question
-      const nextQuestion = getNextQuestion(updatedContext);
-      if (nextQuestion) {
-        setCurrentQuestion(nextQuestion.key);
-        setCurrentChips(getQuestionChips(nextQuestion, updatedContext));
-        
-        const assistantMessage: Message = {
-          id: (Date.now() + 2).toString(),
-          role: "assistant",
-          content: nextQuestion.key,
-          translationKey: nextQuestion.translationKey,
+          content: "refine_more",
+          translationKey: "chat.refineMore",
           timestamp: new Date(),
         };
+        setMessages(prev => [...prev, refineMoreMessage]);
         
-        setMessages(prev => [...prev, assistantMessage]);
+        // Show refine chips again
+        const refineChips = [
+          "chips.viewUpdatedPlan",
+          "chips.refineLocation",
+          "chips.refineDate",
+          "chips.refineTime",
+          "chips.refineGroup",
+          "chips.refineBudget",
+          "chips.refineCuisine",
+          "chips.refineMood",
+          "chips.refineDuration"
+        ];
+        
+        setCurrentChips(refineChips);
+        setCurrentQuestion("refine");
+        setIsLoadingResponse(false);
+        return;
+      } else {
+        // Normal flow: Add emotional response for date selection
+        const dateObj = new Date(dateISO + 'T00:00:00');
+        const today = new Date();
+        const tomorrow = new Date(today);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        const dayOfWeek = dateObj.getDay();
+        
+        let dateType: 'today' | 'tomorrow' | 'future' | 'weekend';
+        if (dateObj.toDateString() === today.toDateString()) {
+          dateType = 'today';
+        } else if (dateObj.toDateString() === tomorrow.toDateString()) {
+          dateType = 'tomorrow';
+        } else if (dayOfWeek === 0 || dayOfWeek === 6) {
+          dateType = 'weekend';
+        } else {
+          dateType = 'future';
+        }
+        
+        const emotionalResponse = getDateResponse(dateType, language);
+        
+        if (emotionalResponse) {
+          const emotionalMessage: Message = {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content: emotionalResponse,
+            timestamp: new Date(),
+            isDynamic: true,
+            dynamicType: 'date',
+            dynamicParams: { dateType },
+          };
+          setMessages(prev => [...prev, emotionalMessage]);
+        }
+        
+        // Move to next question
+        const nextQuestion = getNextQuestion(updatedContext);
+        if (nextQuestion) {
+          setCurrentQuestion(nextQuestion.key);
+          setCurrentChips(getQuestionChips(nextQuestion, updatedContext));
+          
+          const assistantMessage: Message = {
+            id: (Date.now() + 2).toString(),
+            role: "assistant",
+            content: nextQuestion.key,
+            translationKey: nextQuestion.translationKey,
+            timestamp: new Date(),
+          };
+          
+          setMessages(prev => [...prev, assistantMessage]);
+        }
       }
       
       setIsLoadingResponse(false);
@@ -1775,7 +1913,7 @@ setMessages((prev: Message[]) => [...prev, ...messagesArr]);
     const eventType = context.event?.type;
     const location = context.location?.text || userCity || undefined;
     const date = context.event?.dateISO 
-      ? new Date(context.event.dateISO).toLocaleDateString('es-ES', { 
+      ? new Date(context.event.dateISO).toLocaleDateString(language === 'es' ? 'es-ES' : 'en-US', { 
           weekday: 'long', 
           year: 'numeric', 
           month: 'long', 
@@ -1787,7 +1925,8 @@ setMessages((prev: Message[]) => [...prev, ...messagesArr]);
     if (context.participants?.size) {
       groupSize = context.participants.size.toString();
       if (context.participants.kids && context.participants.kids > 0) {
-        groupSize += ' (con niños)';
+        const t = translations[language];
+        groupSize += ` (${t.email.withKids})`;
       }
     }
 
@@ -1797,6 +1936,88 @@ setMessages((prev: Message[]) => [...prev, ...messagesArr]);
   };
 
   const handlePlanReady = async () => {
+    // Validate context before sending to Yelp
+    const validation = validatePlanContext(context);
+    
+    if (!validation.isValid) {
+      console.error('[Validation] Context validation failed:', validation.errors);
+      
+      // Don't show the plan if validation fails
+      setShowPlan(false);
+      setIsLoadingPlan(false);
+      
+      // Find the first error
+      const firstError = validation.errors[0];
+      const fieldKey = firstError.field;
+      
+      // Track retry attempts
+      const currentRetries = validationRetries[fieldKey] || 0;
+      const newRetries = currentRetries + 1;
+      
+      // Critical fields (event, location) - never skip, always re-ask
+      const criticalFields = ['event', 'location'];
+      const isCritical = criticalFields.includes(fieldKey);
+      
+      // If non-critical field has failed 3 times, use default value
+      if (!isCritical && newRetries >= 3) {
+        console.log(`[Validation] Field ${fieldKey} failed 3 times, using default value`);
+        
+        // Set default values for optional fields
+        const defaultContext = { ...context };
+        
+        if (fieldKey === 'preferences') {
+          // Default: any cuisine, any mood
+          defaultContext.preferences = {
+            ...context.preferences,
+            cuisine: ['any'],
+            mood: ['any'],
+          };
+        } else if (fieldKey === 'budget') {
+          // Default: moderate budget
+          defaultContext.budget = { tier: '$$' };
+        } else if (fieldKey === 'participants') {
+          // Default: 2 people
+          defaultContext.participants = {
+            ...context.participants,
+            size: 2,
+          };
+        }
+        
+        setContext(defaultContext);
+        setValidationRetries({ ...validationRetries, [fieldKey]: 0 }); // Reset
+        
+        // Try again with defaults
+        setTimeout(() => handlePlanReady(), 100);
+        return;
+      }
+      
+      // Update retry count
+      setValidationRetries({ ...validationRetries, [fieldKey]: newRetries });
+      
+      // Map field to question
+      const fieldToQuestion: Record<string, QuestionKey> = {
+        'event': 'date',
+        'location': 'location',
+        'participants': 'groupSize',
+        'preferences': 'cuisine',
+        'budget': 'budget',
+      };
+      
+      const questionKey = fieldToQuestion[fieldKey];
+      if (questionKey) {
+        setCurrentQuestion(questionKey);
+        const question = CONVERSATION_FLOW.find(q => q.key === questionKey);
+        if (question) {
+          setCurrentChips(getQuestionChips(question, context));
+        }
+      }
+      
+      return;
+    }
+    
+    // Validation passed - reset retry counters
+    setValidationRetries({});
+    
     setIsLoadingPlan(true);
     
     const blocks = deriveBlocks(context);
